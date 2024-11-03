@@ -3,13 +3,28 @@ import json
 import threading
 import time
 from openai import OpenAI
+import logging
+import os
+from tools import get_delivery_date, get_order_status, get_order_shipping_address
 
+# Set up logging
+filename = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".log"
+if not os.path.exists("logs"):
+    os.makedirs("logs")
+logging.basicConfig(filename="logs/" + filename, level=logging.DEBUG,
+                    format="%(asctime)s - %(levelname)s - %(message)s")
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+formatter = logging.Formatter("[%(levelname)s] %(message)s")
+console.setFormatter(formatter)
+logging.getLogger("").addHandler(console)
+# Disable OpenAI and httpx logging
+logging.getLogger("openai").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.ERROR)
+
+# Initialize the OpenAI client
 client = OpenAI()
-
-
-def get_delivery_date(order_id: str) -> datetime:
-    # In a real-world scenario, you would query a database or API to get the delivery date
-    return datetime.now() + timedelta(days=7)
+CHATGPT_MODEL = "gpt-4-turbo"
 
 
 class AgentCore:
@@ -19,13 +34,49 @@ class AgentCore:
                 "type": "function",
                 "function": {
                     "name": "get_delivery_date",
-                    "description": "Get the delivery date for a customer's order. Call this whenever you need to know the delivery date, for example when a customer asks 'Where is my package'. Ask the user for their order ID and pass it as the 'order_id' parameter (unless you already have it).",
+                    "description": "Get the delivery date for a customer's order. Call this whenever you need to know the delivery date, for example when a customer asks 'When is my order coming?'. Ask the user for their order ID and pass it as the 'order_id' parameter (unless you already have it).",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "order_id": {
                                 "type": "string",
-                                "description": "The customer's order ID.",
+                                "description": "The customer's order ID, provided by the user.",
+                            },
+                        },
+                        "required": ["order_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_order_status",
+                    "description": "Get the status of a customer's order. Call this whenever you need to know the status of an order, for example when a customer asks 'What is the status of my order?'. Ask the user for their order ID and pass it as the 'order_id' parameter (unless you already have it).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "order_id": {
+                                "type": "string",
+                                "description": "The customer's order ID, provided by the user.",
+                            },
+                        },
+                        "required": ["order_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_order_shipping_address",
+                    "description": "Get the shipping address for a customer's order. Call this whenever you need to know the shipping address of an order, for example when a customer asks 'Where is my order being shipped?'. Ask the user for their order ID and pass it as the 'order_id' parameter (unless you already have it).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "order_id": {
+                                "type": "string",
+                                "description": "The customer's order ID, provided by the user.",
                             },
                         },
                         "required": ["order_id"],
@@ -44,7 +95,7 @@ class AgentCore:
         self.messages = [
             {
                 "role": "system",
-                "content": "You are a helpful customer support assistant. Use the supplied tools to assist the user.",
+                "content": "You are a helpful customer support assistant. Use the supplied tools to assist the user. When a user asks for the status of the order, they want to know both the status and the expected delivery date, so you can call multiple tools. The latest order ID is # 306-3621584-1622342. Always specify the order ID when talking about an order.",
             }
         ]
 
@@ -57,37 +108,46 @@ class AgentCore:
     def respond_to_prompt(self, prompt):
         self.messages.append({"role": "user", "content": prompt})
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo", messages=self.messages, tools=self.tools
+            model=CHATGPT_MODEL, messages=self.messages, tools=self.tools
         )
         message = response.choices[0].message
         self.messages.append(message.to_dict())
 
         if message.tool_calls is not None:
+            debug_str = "\n\n[DEBUG]\nTo answer this question, the bot used the following Tools:"
             while message.tool_calls is not None:
-                tool_call = message.tool_calls[0]
-                function_name = tool_call.function.name
-                arguments = json.loads(tool_call.function.arguments)
-                function_response = self.call_function(function_name, arguments)
-                function_call_result_message = {
-                    "role": "tool",
-                    "content": json.dumps(
-                        {
-                            "arguments": arguments,
-                            "function_output": str(function_response),
-                        }
-                    ),
-                    "tool_call_id": tool_call.id,
-                }
-                self.messages.append(function_call_result_message)
+
+                for tool_call in message.tool_calls:
+
+                    function_name = tool_call.function.name
+                    arguments = json.loads(tool_call.function.arguments)
+                    function_response = self.call_function(function_name, arguments)
+                    function_call_result_message = {
+                        "role": "tool",
+                        "content": json.dumps(
+                            {
+                                "arguments": arguments,
+                                "function_output": str(function_response),
+                            }
+                        ),
+                        "tool_call_id": tool_call.id,
+                    }
+                    self.messages.append(function_call_result_message)
+
+                    debug_str += f"\n- {function_name}() with arguments: {arguments}; returned: {function_response}"
+
                 response = client.chat.completions.create(
-                    model="gpt-3.5-turbo",
+                    model=CHATGPT_MODEL,
                     messages=self.messages,
                     tools=self.tools,
                 )
+
                 message = response.choices[0].message
                 self.messages.append(message)
-
-            return message.content
+                output = message.content
+                output += debug_str
+                
+            return output
 
         else:
             return message.content
@@ -109,11 +169,14 @@ def animate_spinner(spinner_generator):
 # CLI functionality
 def main():
     agent = AgentCore()
-    print("Autonomous Generative Agent CLI")
+    print("Generative Agent CLI")
     print("Type 'exit' to quit.\n")
+    print("--------------------------------------------------\n")
 
     while True:
+        
         user_prompt = input("You: ")
+        print("\n--------------------------------------------------")
         if user_prompt.lower() == "exit":
             print("Exiting.")
             break
@@ -129,7 +192,7 @@ def main():
         spinner_thread.join()  # Wait for the spinner thread to finish
 
         print("Agent:", response)
-        print()
+        print("\n--------------------------------------------------\n")
 
 
 if __name__ == "__main__":
